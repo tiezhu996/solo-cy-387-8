@@ -1,7 +1,7 @@
 from django.db import models
 
 from app.apps.properties.models import Property
-from app.constants.enums import CONTRACT_STATUS, CONTRACT_STATUS_PENDING
+from app.constants.enums import CONTRACT_STATUS, CONTRACT_STATUS_ACTIVE, CONTRACT_STATUS_PENDING
 
 
 class Contract(models.Model):
@@ -22,6 +22,14 @@ class Contract(models.Model):
 
     class Meta:
         ordering = ['-id']
+        constraints = [
+            # 同一房源最多一份生效合同：并发确认时由数据库兜底拒绝
+            models.UniqueConstraint(
+                fields=['property'],
+                condition=models.Q(status=CONTRACT_STATUS_ACTIVE),
+                name='unique_active_contract_per_property',
+            )
+        ]
 
     def __str__(self) -> str:
         return f'合同#{self.id} 房源{self.property_id} {self.status} v{self.version}'

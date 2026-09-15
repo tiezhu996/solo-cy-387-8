@@ -1,7 +1,7 @@
 from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 
 from app.apps.properties.models import Property
@@ -129,15 +129,36 @@ def _assert_not_terminated(contract: Contract) -> None:
 
 @transaction.atomic
 def confirm_contract(contract_id: int) -> Contract:
-    """租客确认：合同生效，房源转为已签约。"""
+    """租客确认：合同生效，房源转为已签约。
+
+    同一房源只允许一份生效合同：先锁房源串行化并发确认，再核对是否已有
+    其他生效合同；数据库部分唯一约束兜底，失败时整个事务回滚，合同、
+    房源与历史数据均不变。
+    """
     contract = _get_contract_locked(contract_id)
     _assert_not_terminated(contract)
     if contract.status != CONTRACT_STATUS_PENDING:
         raise BusinessError('CONTRACT_STATUS_INVALID', f'合同当前状态为{contract.status}，仅待确认合同可确认')
 
+    property_obj = Property.objects.select_for_update().filter(id=contract.property_id).first()
+    if property_obj is None:
+        raise BusinessError('PROPERTY_NOT_FOUND', status_code=404)
+
+    has_active = (
+        Contract.objects.filter(property_id=contract.property_id, status=CONTRACT_STATUS_ACTIVE)
+        .exclude(id=contract.id)
+        .exists()
+    )
+    if has_active:
+        raise BusinessError('CONTRACT_DUPLICATE', '该房源已存在生效合同，不能重复签署')
+
     contract.status = CONTRACT_STATUS_ACTIVE
     contract.version += 1
-    contract.save(update_fields=['status', 'version', 'updated_at'])
+    try:
+        with transaction.atomic():  # 保存点：唯一约束冲突时仅回滚本次写入
+            contract.save(update_fields=['status', 'version', 'updated_at'])
+    except IntegrityError:
+        raise BusinessError('CONTRACT_DUPLICATE', '该房源已存在生效合同，不能重复签署')
 
     Property.objects.filter(id=contract.property_id).update(status=HOUSE_STATUS_SIGNED)
     logger.info('合同生效 contract=%s property=%s 已签约', contract.id, contract.property_id)
