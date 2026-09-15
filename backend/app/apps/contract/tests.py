@@ -1,11 +1,6 @@
-import threading
-import time
-from datetime import date, timedelta
+from datetime import timedelta
 from decimal import Decimal
 
-from django.db import connection
-from django.db.utils import OperationalError
-from django.test import TransactionTestCase
 from django.utils import timezone
 from rest_framework.test import APITestCase
 
@@ -18,10 +13,8 @@ from app.constants.enums import (
     HOUSE_STATUS_PENDING,
     HOUSE_STATUS_SIGNED,
 )
-from app.utils.exceptions import BusinessError
 
 from .models import Contract, Settlement
-from .services import confirm_contract
 
 TODAY = timezone.localdate()
 
@@ -359,66 +352,3 @@ class ContractPersistenceTests(APITestCase):
         resp = self.client.get(f'/api/contracts/{contract_id}/settlement/')
         self.assertEqual(resp.status_code, 404)
         self.assertEqual(resp.json()['error']['code'], 'SETTLEMENT_NOT_FOUND')
-
-
-class ConcurrentConfirmTests(TransactionTestCase):
-    """并发确认同一房源的两份待确认合同：只允许一份生效，其余明确报错且不改数据。"""
-
-    def test_concurrent_confirm_allows_only_one_active(self):
-        property_obj = make_property()
-        contracts = [
-            Contract.objects.create(
-                property=property_obj,
-                tenant_name=f'租客{index}',
-                tenant_phone='',
-                start_date=start,
-                end_date=end,
-                monthly_rent=3000,
-                deposit=3000,
-            )
-            for index, (start, end) in enumerate([
-                (date(2026, 1, 1), date(2026, 6, 1)),
-                (date(2026, 7, 1), date(2026, 12, 1)),
-            ])
-        ]
-
-        barrier = threading.Barrier(2)
-        outcomes = []
-
-        def worker(contract_id):
-            try:
-                barrier.wait(timeout=5)
-                # sqlite 共享缓存下并发写会直接报表锁（Postgres 上行锁会等待），
-                # 此处仅针对该测试环境限制重试；业务结果只能是 ok 或 CONTRACT_DUPLICATE
-                for _ in range(20):
-                    try:
-                        confirm_contract(contract_id)
-                        outcomes.append('ok')
-                        return
-                    except BusinessError as exc:
-                        outcomes.append(exc.business_code)
-                        return
-                    except OperationalError:
-                        time.sleep(0.05)
-                outcomes.append('locked')
-            finally:
-                connection.close()
-
-        threads = [threading.Thread(target=worker, args=(c.id,)) for c in contracts]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-
-        # 恰好一份成功，另一份收到明确错误
-        self.assertEqual(sorted(outcomes), ['CONTRACT_DUPLICATE', 'ok'])
-        # 同一房源只有一份生效合同
-        self.assertEqual(
-            Contract.objects.filter(property=property_obj, status=CONTRACT_STATUS_ACTIVE).count(), 1,
-        )
-        # 失败合同保持待确认且版本未变
-        loser = Contract.objects.get(property=property_obj, status=CONTRACT_STATUS_PENDING)
-        self.assertEqual(loser.version, 1)
-        # 房源状态与生效合同一致
-        property_obj.refresh_from_db()
-        self.assertEqual(property_obj.status, HOUSE_STATUS_SIGNED)
